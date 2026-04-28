@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+trap 'rc=$?; echo "ERROR: install failed at line ${LINENO}: ${BASH_COMMAND}" >&2; exit "$rc"' ERR
 
 IMAGE="tobyxdd/hysteria:latest"
 CONTAINER_NAME="hysteria2"
@@ -140,7 +141,7 @@ check_os() {
 
 apt_install_minimal() {
   DEBIAN_FRONTEND=noninteractive apt-get update
-  DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
+  DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends --no-upgrade "$@"
 }
 
 ensure_base_tools() {
@@ -175,7 +176,7 @@ check_ports() {
     log "TCP 443 may be used by Amnezia Xray/REALITY. This does not conflict with Hysteria on UDP ${PORT}."
   fi
   if [[ "$TLS_MODE" == "letsencrypt-ip" && "$CERTBOT_MODE" == "standalone" ]]; then
-    if port_is_listening_tcp 80; then
+    if ! letsencrypt_cert_exists && port_is_listening_tcp 80; then
       echo "TCP port 80 is already in use. Certbot standalone mode needs TCP 80 for Let's Encrypt IP certificate validation. This script will not stop existing services automatically."
       ss -lntp | grep ':80' || true
       exit 1
@@ -235,6 +236,74 @@ prepare_install_dir() {
   install -d -m 700 "$INSTALL_DIR/backups"
 }
 
+json_field() {
+  local file="$1" field="$2"
+  [[ -f "$file" ]] || return 1
+  python3 - "$file" "$field" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as f:
+        value = json.load(f).get(sys.argv[2], "")
+except Exception:
+    value = ""
+if value is None:
+    value = ""
+print(value)
+PY
+}
+
+container_exists() {
+  docker ps -a --format '{{.Names}}' | grep -Fxq "$CONTAINER_NAME"
+}
+
+letsencrypt_cert_exists() {
+  [[ -f "/etc/letsencrypt/live/${IP}/fullchain.pem" && -f "/etc/letsencrypt/live/${IP}/privkey.pem" ]]
+}
+
+existing_install_matches_request() {
+  local json="$INSTALL_DIR/install-result.json" existing_ip existing_port existing_tls
+  [[ -f "$json" ]] || return 1
+  existing_ip="$(json_field "$json" ip 2>/dev/null || true)"
+  existing_port="$(json_field "$json" port 2>/dev/null || true)"
+  existing_tls="$(json_field "$json" tls_mode 2>/dev/null || true)"
+  [[ "$existing_ip" == "$IP" && "$existing_port" == "$PORT" && "$existing_tls" == "$TLS_MODE" ]]
+}
+
+maybe_finish_existing_install() {
+  container_exists || return 0
+  if (( FORCE == 1 )); then
+    return 0
+  fi
+  if ! existing_install_matches_request; then
+    die "Container ${CONTAINER_NAME} already exists, but install artifacts are missing or do not match requested --ip/--port/--tls. Re-run with --force to replace only this container."
+  fi
+  if ! docker ps --format '{{.Names}}' | grep -Fxq "$CONTAINER_NAME"; then
+    docker start "$CONTAINER_NAME" >/dev/null
+  fi
+  verify_container
+  CLIENT_URI="$(json_field "$INSTALL_DIR/install-result.json" uri)"
+  CERT_PATH="$(json_field "$INSTALL_DIR/install-result.json" cert_path)"
+  RENEWAL_TIMER="$(json_field "$INSTALL_DIR/install-result.json" renew_timer)"
+  log "Existing Hysteria 2 installation already matches this request. No changes made."
+  final_output
+  exit 0
+}
+
+install_dir_has_partial_state() {
+  [[ -d "$INSTALL_DIR" ]] || return 1
+  find "$INSTALL_DIR" -mindepth 1 -maxdepth 1 ! -name backups -print -quit | grep -q .
+}
+
+reject_partial_install() {
+  container_exists && return 0
+  if install_dir_has_partial_state; then
+    die "Partial Hysteria install state exists in ${INSTALL_DIR}, but container ${CONTAINER_NAME} does not exist. Run uninstall first, then install again: curl -fsSL https://raw.githubusercontent.com/Nazarinh0/hysteria-auto/main/uninstall.sh | bash -s -- --remove-files --remove-cert --ip ${IP} --force"
+  fi
+  if [[ "$TLS_MODE" == "letsencrypt-ip" ]] && letsencrypt_cert_exists; then
+    die "Let's Encrypt certificate lineage for ${IP} already exists, but container ${CONTAINER_NAME} does not exist. Run uninstall with --remove-cert first, then install again."
+  fi
+}
+
 backup_existing_files() {
   local paths=(
     "$INSTALL_DIR/config.yaml"
@@ -263,10 +332,7 @@ backup_existing_files() {
 }
 
 handle_existing_container() {
-  if docker ps -a --format '{{.Names}}' | grep -Fxq "$CONTAINER_NAME"; then
-    if (( FORCE == 0 )); then
-      die "Container ${CONTAINER_NAME} already exists. Re-run with --force to stop and remove only this container after backing up files."
-    fi
+  if container_exists; then
     docker stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
     docker rm "$CONTAINER_NAME" >/dev/null 2>&1 || true
   fi
@@ -286,17 +352,27 @@ system_certbot_ok() {
 }
 
 ensure_certbot() {
-  [[ "$TLS_MODE" == "letsencrypt-ip" ]] || return
+  [[ "$TLS_MODE" == "letsencrypt-ip" ]] || return 0
   if system_certbot_ok; then
     CERTBOT_BIN="$(command -v certbot)"
     log "Using system certbot: $CERTBOT_BIN"
     return
   fi
+  if [[ -x "$INSTALL_DIR/certbot-venv/bin/certbot" ]]; then
+    local existing_version
+    existing_version="$("$INSTALL_DIR/certbot-venv/bin/certbot" --version 2>/dev/null | grep -Eo '[0-9]+(\.[0-9]+)+' | head -n1 || true)"
+    if [[ -n "$existing_version" ]] && version_ge "5.4" "$existing_version"; then
+      CERTBOT_BIN="$INSTALL_DIR/certbot-venv/bin/certbot"
+      log "Using existing isolated certbot: $CERTBOT_BIN"
+      return
+    fi
+  fi
   log "Installing isolated certbot >= 5.4 into ${INSTALL_DIR}/certbot-venv"
-  apt_install_minimal python3 python3-venv python3-pip
-  python3 -m venv "$INSTALL_DIR/certbot-venv"
-  "$INSTALL_DIR/certbot-venv/bin/pip" install --upgrade pip
-  "$INSTALL_DIR/certbot-venv/bin/pip" install "certbot>=5.4"
+  if ! python3 -m venv "$INSTALL_DIR/certbot-venv" >/dev/null 2>&1; then
+    apt_install_minimal python3-venv
+    python3 -m venv "$INSTALL_DIR/certbot-venv"
+  fi
+  "$INSTALL_DIR/certbot-venv/bin/python" -m pip install --upgrade "certbot>=5.4"
   CERTBOT_BIN="$INSTALL_DIR/certbot-venv/bin/certbot"
   "$CERTBOT_BIN" --version | grep -Eo '[0-9]+(\.[0-9]+)+' | head -n1 | while read -r version; do
     version_ge "5.4" "$version" || die "Installed certbot version $version is below 5.4."
@@ -326,7 +402,7 @@ configure_firewall() {
 }
 
 issue_letsencrypt_ip_cert() {
-  [[ "$TLS_MODE" == "letsencrypt-ip" ]] || return
+  [[ "$TLS_MODE" == "letsencrypt-ip" ]] || return 0
   log "Requesting Let's Encrypt IP certificate for ${IP}. TCP 80 must be reachable from the internet."
   "$CERTBOT_BIN" certonly \
     --standalone \
@@ -341,7 +417,7 @@ issue_letsencrypt_ip_cert() {
 }
 
 create_self_signed_cert() {
-  [[ "$TLS_MODE" == "self-signed" ]] || return
+  [[ "$TLS_MODE" == "self-signed" ]] || return 0
   openssl req -x509 \
     -newkey rsa:2048 \
     -sha256 \
@@ -444,7 +520,7 @@ PY
 }
 
 write_renew_script() {
-  [[ "$TLS_MODE" == "letsencrypt-ip" ]] || return
+  [[ "$TLS_MODE" == "letsencrypt-ip" ]] || return 0
   cat >"$INSTALL_DIR/renew-cert.sh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
@@ -464,7 +540,7 @@ EOF
 }
 
 install_renew_timer() {
-  [[ "$TLS_MODE" == "letsencrypt-ip" ]] || return
+  [[ "$TLS_MODE" == "letsencrypt-ip" ]] || return 0
   cat >/etc/systemd/system/hysteria2-cert-renew.service <<EOF
 [Unit]
 Description=Renew Let's Encrypt IP certificate for Hysteria 2
@@ -616,13 +692,15 @@ main() {
   validate_args
   check_os
   ensure_base_tools
-  check_ports
-  prepare_install_dir
-  backup_existing_files
   ensure_docker
   check_docker_iptables
   detect_amnezia_containers
+  maybe_finish_existing_install
+  reject_partial_install
+  prepare_install_dir
+  backup_existing_files
   handle_existing_container
+  check_ports
   ensure_certbot
   configure_firewall
   issue_letsencrypt_ip_cert
