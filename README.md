@@ -1,4 +1,4 @@
-# Hysteria 2 Docker IP Deployer
+# Hysteria 2 Deployer
 
 Самостоятельный bash-deployer для установки Hysteria 2 на Ubuntu/Debian VPS.
 
