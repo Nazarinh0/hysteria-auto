@@ -1,0 +1,9 @@
+task.md
+deploy.env
+.env
+*.pem
+*.key
+*.crt
+client-uri.txt
+install-result.json
+server-info.txt
